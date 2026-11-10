@@ -2,7 +2,13 @@
 --[[
 	Blossom UI Library (single file)
 
-	local Blossom = loadstring(readfile("Blossom.luau"))()      -- executor
+	local response = request({
+    Url = "https://raw.githubusercontent.com/mmr1337/Blossom/refs/heads/main/Blossom.luau",
+    Method = "GET"
+})
+
+assert(response and response.StatusCode == 200, "Failed to load Blossom")
+local Blossom = loadstring(response.Body)()      -- executor
 	local Blossom = require(path.to.Blossom)                    -- Studio
 
 	local Window = Blossom.new({ Title = "Blossom", Script = "blossom.lua", Build = "operation one" })
