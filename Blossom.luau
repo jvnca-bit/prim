@@ -1749,6 +1749,139 @@ local function guiParent(screen)
 	end
 end
 
+-- Cross-server chat backed by a user-provided HTTP endpoint.
+-- The UI is rendered with Blossom's own label()/new() helpers.
+function Window:CreateGlobalChat(options)
+	options = options or {}
+	local endpoint = tostring(options.Endpoint or "")
+	assert(endpoint ~= "", "CreateGlobalChat requires Endpoint")
+	local base = endpoint:gsub("%?.*$", ""):gsub("/+$", "")
+	local pollInterval = math.max(2, tonumber(options.PollInterval) or 4)
+	local maxMessages = math.clamp(tonumber(options.MaxMessages) or 80, 10, 150)
+	local tab = self:Tab({ Name = options.Name or "Global Chat", Icon = options.Icon or "message-circle" })
+	for _, column in tab.Columns do column.Scroll.Visible = false end
+
+	local page = tab.Page
+	local header = label(page, { Text = options.Title or "Global Chat", TextSize = 15, Weight = Enum.FontWeight.SemiBold, X = 10, Y = 8, RowH = 22 })
+	local status = label(page, { Text = "Connecting…", TextSize = 11, Fg = "InactiveText", X = 10, Y = 31, RowH = 16 })
+	local feed = new("ScrollingFrame", {
+		Bg = "Inline", Position = Offset(10, 54), Size = Dim2(1, -20, 1, -108),
+		ScrollBarThickness = 3, CanvasSize = Offset(0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y, Border = "Outline", Radius = Metrics.Radius,
+	}, page)
+	local list = new("Frame", { Position = Offset(8, 8), Size = Dim2(1, -16, 0, 0) }, feed)
+	local layout = new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, list)
+	local inputFrame = new("Frame", { Bg = "Element", Position = Dim2(0, 10, 1, -44), Size = Dim2(1, -88, 0, 34), Radius = Metrics.Radius, Border = "Outline" }, page)
+	local input = new("TextBox", {
+		Fg = "Text", PlaceholderText = options.Placeholder or "Type a message…", Text = "", TextSize = 13,
+		Position = Offset(8, 8), Size = Dim2(1, -16, 1, -16), ClearTextOnFocus = false,
+	}, inputFrame)
+	bind(input, "PlaceholderColor3", "InactiveText")
+	local send = new("TextButton", {
+		Bg = "Accent", Fg = "Text", Text = "Send", TextSize = 12, Weight = Enum.FontWeight.SemiBold,
+		Position = Dim2(1, -68, 1, -44), Size = Offset(58, 34), Radius = Metrics.Radius,
+	}, page)
+	local active, sending, lastSignature = true, false, ""
+	local seen = {}
+	local function http(method, url, body)
+		local env = typeof(getgenv) == "function" and getgenv() or _G
+		local req = (env and (env.request or env.http_request)) or request or http_request
+		assert(type(req) == "function", "No executor HTTP request function is available")
+		local args = { Url = url, Method = method, Headers = { ["Content-Type"] = "application/json" } }
+		if body then args.Body = HttpService:JSONEncode(body) end
+		local response = req(args)
+		local statusCode = response and (response.StatusCode or response.Status)
+		assert(response and (statusCode == nil or (statusCode >= 200 and statusCode < 300)), "HTTP request failed")
+		return response.Body or response.body or ""
+	end
+	local function setStatus(text, good)
+		if status and status.Parent then
+			setText(status, text)
+			bind(status, "TextColor3", good and "Accent" or "InactiveText")
+		end
+	end
+	local function render(messages)
+		for _, child in list:GetChildren() do
+			if child ~= layout then child:Destroy() end
+		end
+		local count = math.min(#messages, maxMessages)
+		for index = math.max(1, #messages - maxMessages + 1), #messages do
+			local item = messages[index]
+			if type(item) == "table" then
+				local username = tostring(item.username or item.Username or "Player"):sub(1, 32)
+				local message = tostring(item.message or item.Message or ""):sub(1, 350)
+				local row = new("Frame", { Size = Dim2(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, list)
+				label(row, { Text = username, Fg = "Accent", TextSize = 11, Weight = Enum.FontWeight.SemiBold, RowH = 15, W = 180 })
+				local body = label(row, { Text = message, Fg = "Text", TextSize = 12, Y = 15, RowH = 17, Right = 2 })
+				body.TextWrapped = true
+				body.AutomaticSize = Enum.AutomaticSize.Y
+				body.Size = Dim2(1, -2, 0, 17)
+				row.AutomaticSize = Enum.AutomaticSize.Y
+			end
+		end
+		task.defer(function()
+			if feed and feed.Parent then feed.CanvasPosition = Vec2(0, math.max(0, feed.AbsoluteCanvasSize.Y)) end
+		end)
+	end
+	local function fetch()
+		local raw = http("GET", base .. "?action=messages")
+		local decoded = HttpService:JSONDecode(raw)
+		local messages = type(decoded) == "table" and (decoded.messages or decoded.data or decoded) or {}
+		if type(messages) ~= "table" then messages = {} end
+		local signature = tostring(#messages)
+		if #messages > 0 then
+			local last = messages[#messages]
+			if type(last) == "table" then signature ..= ":" .. tostring(last.id or last.timestamp or last.message or "") end
+		end
+		if signature ~= lastSignature then
+			lastSignature = signature
+			render(messages)
+		end
+	end
+	local function submit()
+		if sending then return end
+		local message = input.Text:gsub("^%s+", ""):gsub("%s+$", "")
+		if message == "" then return end
+		if #message > 350 then message = message:sub(1, 350) end
+		sending = true
+		local env = typeof(getgenv) == "function" and getgenv() or _G
+		local player = Players.LocalPlayer
+		local payload = {
+			username = (player and player.DisplayName) or "Player",
+			userId = (player and tostring(player.UserId)) or "0",
+			message = message,
+		}
+		local ok, err = pcall(function() http("POST", base .. "?action=send", payload) end)
+		if ok then input.Text = ""; setStatus("Connected • message sent", true)
+		else setStatus("Send failed: " .. tostring(err), false) end
+		sending = false
+	end
+	send.MouseButton1Click:Connect(submit)
+	input.FocusLost:Connect(function(enterPressed) if enterPressed then submit() end end)
+	local controller = { Tab = tab, Feed = feed, Input = input, SendButton = send }
+	function controller:Refresh()
+		local ok, err = pcall(fetch)
+		if not ok then setStatus("Connection error: " .. tostring(err), false) end
+	end
+	function controller:Send(message)
+		input.Text = tostring(message or "")
+		submit()
+	end
+	function controller:Destroy()
+		active = false
+		if tab.Page and tab.Page.Parent then tab.Page:Destroy() end
+	end
+	task.spawn(function()
+		while active and self.Screen and self.Screen.Parent do
+			local ok, err = pcall(fetch)
+			if ok then setStatus("Connected", true)
+			else setStatus("Connection error: " .. tostring(err), false) end
+			task.wait(pollInterval)
+		end
+	end)
+	return controller
+end
+
 function Window:Category(name)
 	local y = self.SidebarY + (self.SidebarHasTabs and Metrics.TabToCategory or 0)
 	label(self.Sidebar, { Fg = "InactiveText", Text = name, TextSize = 9, X = Metrics.Pad, RowH = 12, Y = y - 6, W = 120 })
